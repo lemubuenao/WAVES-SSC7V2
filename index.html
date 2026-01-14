@@ -1,0 +1,437 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, onSnapshot, updateDoc, setDoc, serverTimestamp, collection, query } from 'firebase/firestore';
+import { 
+  Play, Pause, RotateCcw, Volume2, VolumeX, 
+  Settings, ArrowLeft, Package, Clock, 
+  Bell, Megaphone, Calendar, RefreshCw 
+} from 'lucide-react';
+
+// Configurações globais do ambiente (injetadas automaticamente)
+const firebaseConfig = JSON.parse(__firebase_config);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// Inicialização dos serviços Firebase
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('timer'); 
+  const [isMuted, setIsMuted] = useState(false);
+  const [systemTime, setSystemTime] = useState('');
+  const [availableVoices, setAvailableVoices] = useState([]);
+  const [selectedVoiceName, setSelectedVoiceName] = useState('');
+  
+  // Estado Inicial da Aplicação
+  const INITIAL_STATE = {
+    activeWaveIndex: 0,
+    isRunning: false,
+    serverStartTime: null,
+    secondsRemainingOnPause: 30 * 60,
+    alarmTriggerMinutes: 1,
+    alarmRepeatSeconds: 45,
+    isHornEnabled: true,
+    isAutoStartEnabled: false,
+    scheduledStartTime: "12:30",
+    waves: [
+      { id: 1, name: 'Onda 1', duration: 30 * 60, startTime: '12:30' },
+      { id: 2, name: 'Onda 2', duration: 20 * 60, startTime: '13:00' },
+      { id: 3, name: 'Onda 3', duration: 20 * 60, startTime: '13:20' },
+      { id: 4, name: 'Onda 4', duration: 20 * 60, startTime: '13:40' },
+      { id: 5, name: 'Onda 5', duration: 20 * 60, startTime: '14:00' },
+      { id: 6, name: 'Onda 6', duration: 20 * 60, startTime: '14:20' },
+      { id: 7, name: 'Onda 7', duration: 5 * 60, startTime: '14:40' },
+    ]
+  };
+
+  const [syncData, setSyncData] = useState(INITIAL_STATE);
+  const [timeLeft, setTimeLeft] = useState(INITIAL_STATE.secondsRemainingOnPause);
+  const lastAnnouncedTrigger = useRef(null);
+  const timerIntervalRef = useRef(null);
+
+  // 1. Autenticação (Regra 3)
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Erro na autenticação:", err);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Sincronização Cloud (Regra 1 e 2)
+  useEffect(() => {
+    if (!user) return;
+    
+    // REGRA 1: Caminho com 5 segmentos para a coleção
+    const collectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'waves_settings_sync');
+    // Documento específico com ID 'global' para garantir 6 segmentos (número par)
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'waves_settings_sync', 'global');
+    
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        setSyncData(docSnap.data());
+      } else {
+        // Inicializa o documento na nuvem se não existir
+        setDoc(docRef, INITIAL_STATE);
+      }
+    }, (error) => {
+      console.error("Erro no Firestore Snapshot:", error);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // 3. Gestão de Vozes e Relógio do Sistema
+  useEffect(() => {
+    const loadVoices = () => {
+      const voices = window.speechSynthesis.getVoices();
+      const ptVoices = voices.filter(v => v.lang.startsWith('pt'));
+      setAvailableVoices(ptVoices);
+      if (ptVoices.length > 0 && !selectedVoiceName) setSelectedVoiceName(ptVoices[0].name);
+    };
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+
+    const clockInterval = setInterval(() => {
+      const now = new Date();
+      const nowStr = now.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+      setSystemTime(nowStr);
+
+      // Verificação de Início Automático
+      if (syncData.isAutoStartEnabled && !syncData.isRunning && syncData.activeWaveIndex === 0 && timeLeft === syncData.waves[0].duration) {
+        if (nowStr === syncData.scheduledStartTime) {
+          handleToggleTimer();
+        }
+      }
+    }, 1000);
+
+    return () => clearInterval(clockInterval);
+  }, [syncData, selectedVoiceName, timeLeft]);
+
+  // 4. Temporizador Sincronizado (Cálculo baseado em Timestamp)
+  useEffect(() => {
+    const updateLocalTimer = () => {
+      if (syncData.isRunning && syncData.serverStartTime) {
+        const now = Date.now();
+        const start = syncData.serverStartTime?.toMillis ? syncData.serverStartTime.toMillis() : (typeof syncData.serverStartTime === 'number' ? syncData.serverStartTime : now);
+        const elapsed = Math.floor((now - start) / 1000);
+        const remaining = Math.max(0, syncData.secondsRemainingOnPause - elapsed);
+        setTimeLeft(remaining);
+
+        if (remaining === 0) {
+          handleWaveComplete();
+        }
+      } else {
+        setTimeLeft(syncData.secondsRemainingOnPause);
+      }
+    };
+
+    updateLocalTimer();
+    timerIntervalRef.current = setInterval(updateLocalTimer, 1000);
+    return () => clearInterval(timerIntervalRef.current);
+  }, [syncData]);
+
+  // 5. Gestão de Alertas (Buzina + Voz)
+  useEffect(() => {
+    if (!syncData.isRunning || timeLeft <= 0) return;
+    
+    const triggerPointSeconds = (syncData.alarmTriggerMinutes || 0) * 60;
+    if (timeLeft <= triggerPointSeconds) {
+      const timePassed = triggerPointSeconds - timeLeft;
+      if (timePassed % (syncData.alarmRepeatSeconds || 45) === 0 && lastAnnouncedTrigger.current !== timeLeft) {
+        lastAnnouncedTrigger.current = timeLeft;
+        const mins = Math.floor(timeLeft / 60);
+        const secs = timeLeft % 60;
+        let timeMsg = (mins > 0 ? `${mins} minuto${mins > 1 ? 's' : ''}` : "") + (secs > 0 ? (mins > 0 ? " e " : "") + `${secs} segundos` : "");
+        
+        if (syncData.isHornEnabled) playHorn();
+        // Atraso curto para a voz não sobrepor o início da buzina
+        setTimeout(() => speak(`ATENÇÃO, ${syncData.waves[syncData.activeWaveIndex].name} prestes a acabar. Restam ${timeMsg}.`), 700);
+      }
+    }
+  }, [timeLeft, syncData.isRunning]);
+
+  // Funções de Controlo
+  const playHorn = () => {
+    if (isMuted || !syncData.isHornEnabled) return;
+    try {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc1 = audioCtx.createOscillator();
+      const osc2 = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+      osc1.type = 'square'; osc2.type = 'sawtooth';
+      osc1.frequency.setValueAtTime(340, audioCtx.currentTime);
+      osc2.frequency.setValueAtTime(345, audioCtx.currentTime);
+      gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
+      gainNode.gain.linearRampToValueAtTime(0.1, audioCtx.currentTime + 0.05);
+      gainNode.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.8);
+      osc1.connect(gainNode); osc2.connect(gainNode); gainNode.connect(audioCtx.destination);
+      osc1.start(); osc2.start(); 
+      osc1.stop(audioCtx.currentTime + 0.8); osc2.stop(audioCtx.currentTime + 0.8);
+      setTimeout(() => audioCtx.close(), 1000);
+    } catch(e) { console.error("Erro Áudio:", e); }
+  };
+
+  const speak = (text) => {
+    if (isMuted || !text) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    const voice = availableVoices.find(v => v.name === selectedVoiceName);
+    if (voice) utterance.voice = voice;
+    else utterance.lang = 'pt-PT';
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const updateCloud = async (updates) => {
+    if (!user) return;
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'waves_settings_sync', 'global');
+    try {
+      await updateDoc(docRef, updates);
+    } catch (err) {
+      console.error("Erro ao atualizar nuvem:", err);
+    }
+  };
+
+  const handleToggleTimer = () => {
+    if (syncData.isRunning) {
+      updateCloud({ isRunning: false, secondsRemainingOnPause: timeLeft });
+    } else {
+      if (timeLeft === syncData.waves[syncData.activeWaveIndex].duration) {
+        speak(`Iniciando a ${syncData.waves[syncData.activeWaveIndex].name}`);
+      }
+      updateCloud({ isRunning: true, serverStartTime: serverTimestamp() });
+    }
+  };
+
+  const handleWaveComplete = () => {
+    if (syncData.isRunning) {
+      updateCloud({ isRunning: false, secondsRemainingOnPause: 0 });
+      speak(`${syncData.waves[syncData.activeWaveIndex].name} finalizada.`);
+    }
+  };
+
+  const handleNextWave = () => {
+    const nextIdx = syncData.activeWaveIndex + 1;
+    if (nextIdx < syncData.waves.length) {
+      updateCloud({
+        activeWaveIndex: nextIdx,
+        secondsRemainingOnPause: syncData.waves[nextIdx].duration,
+        isRunning: false,
+        serverStartTime: null
+      });
+      speak(`Onda seguinte preparada.`);
+    }
+  };
+
+  const handleReset = () => {
+    updateCloud({
+      isRunning: false,
+      activeWaveIndex: 0,
+      secondsRemainingOnPause: syncData.waves[0].duration,
+      serverStartTime: null
+    });
+  };
+
+  // Funções de Cálculo de Horário
+  const addMinutes = (timeStr, mins) => {
+    const [h, m] = timeStr.split(':').map(Number);
+    const date = new Date();
+    date.setHours(h, m + Math.floor(mins), (mins % 1) * 60);
+    return date.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+  };
+
+  const handleUpdateDuration = (index, mins) => {
+    const newWaves = [...syncData.waves];
+    newWaves[index].duration = mins * 60;
+    // Recalcula o encadeamento de todas as ondas seguintes
+    for (let i = 1; i < newWaves.length; i++) {
+      newWaves[i].startTime = addMinutes(newWaves[i-1].startTime, newWaves[i-1].duration / 60);
+    }
+    updateCloud({ 
+      waves: newWaves, 
+      secondsRemainingOnPause: (index === syncData.activeWaveIndex) ? mins * 60 : syncData.secondsRemainingOnPause 
+    });
+  };
+
+  const handleUpdateStartTime = (time) => {
+    const newWaves = [...syncData.waves];
+    newWaves[0].startTime = time;
+    for (let i = 1; i < newWaves.length; i++) {
+      newWaves[i].startTime = addMinutes(newWaves[i-1].startTime, newWaves[i-1].duration / 60);
+    }
+    updateCloud({ scheduledStartTime: time, waves: newWaves });
+  };
+
+  const formatTime = (s) => `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
+  const currentWave = syncData.waves[syncData.activeWaveIndex];
+  const progress = ((currentWave.duration - timeLeft) / currentWave.duration) * 100;
+
+  // Renderização
+  if (view === 'setup') {
+    return (
+      <div className="p-6 md:p-12 max-w-2xl mx-auto" style={{ backgroundColor: '#EBEBEB', minHeight: '100vh' }}>
+        <button onClick={() => setView('timer')} className="flex items-center gap-2 mb-8 text-slate-500 hover:text-slate-900 font-bold transition-colors">
+          <ArrowLeft size={20} /> Painel Principal
+        </button>
+        <h1 className="text-3xl font-black mb-8 text-slate-900 uppercase">Configurações Sincronizadas</h1>
+        
+        <div className="bg-white border border-slate-200 p-8 rounded-xl shadow-sm space-y-8">
+          {/* Agendamento */}
+          <div className="bg-slate-50 p-6 rounded-lg border border-[#3483FA]/20 space-y-4">
+            <h3 className="text-sm font-black text-[#3483FA] flex items-center gap-2 uppercase tracking-widest">
+              <Calendar size={16} /> Horário Início do Turno
+            </h3>
+            <div className="flex gap-4">
+              <input type="time" value={syncData.scheduledStartTime} onChange={(e) => handleUpdateStartTime(e.target.value)} className="bg-white p-3 rounded-lg border border-slate-300 focus:border-[#3483FA] outline-none font-bold text-xl" />
+              <button onClick={() => updateCloud({ isAutoStartEnabled: !syncData.isAutoStartEnabled })} className={`flex-1 p-3 rounded-lg font-bold border transition-all ${syncData.isAutoStartEnabled ? 'bg-[#3483FA] text-white border-[#3483FA]' : 'bg-white text-slate-400 border-slate-200'}`}>
+                {syncData.isAutoStartEnabled ? 'Auto-Start Ativo' : 'Ativar Auto-Start'}
+              </button>
+            </div>
+          </div>
+
+          {/* Tempos de Alerta */}
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-tighter">Alerta Inicial (min):</label>
+              <input type="number" step="0.5" value={syncData.alarmTriggerMinutes} onChange={e => updateCloud({ alarmTriggerMinutes: parseFloat(e.target.value) })} className="w-full p-3 rounded-lg border border-slate-300 outline-none font-bold" />
+            </div>
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-500 uppercase tracking-tighter">Repete a cada (seg):</label>
+              <input type="number" value={syncData.alarmRepeatSeconds} onChange={e => updateCloud({ alarmRepeatSeconds: parseInt(e.target.value) })} className="w-full p-3 rounded-lg border border-slate-300 outline-none font-bold" />
+            </div>
+          </div>
+
+          {/* Preferências Locais */}
+          <div className="space-y-4 pt-4 border-t border-slate-100">
+            <div className="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
+              <div className="flex items-center gap-3">
+                <Megaphone size={20} className="text-[#FFE600]" strokeWidth={3} />
+                <span className="text-sm font-bold">Buzina Industrial</span>
+              </div>
+              <button onClick={() => updateCloud({ isHornEnabled: !syncData.isHornEnabled })} className={`w-12 h-6 rounded-full relative transition-colors ${syncData.isHornEnabled ? 'bg-[#3483FA]' : 'bg-slate-300'}`}>
+                <div className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${syncData.isHornEnabled ? 'left-7' : 'left-1'}`} />
+              </button>
+            </div>
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-500 uppercase">Voz Selecionada:</label>
+              <select value={selectedVoiceName} onChange={e => setSelectedVoiceName(e.target.value)} className="w-full p-3 rounded-lg border border-slate-300 outline-none text-sm font-bold">
+                {availableVoices.map(v => <option key={v.name} value={v.name}>{v.name}</option>)}
+              </select>
+            </div>
+          </div>
+
+          {/* Duração das Ondas */}
+          <div className="pt-6 border-t border-slate-100">
+            <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest text-center mb-4">Duração das Ondas (Minutos)</h3>
+            <div className="space-y-3">
+              {syncData.waves.map((w, i) => (
+                <div key={w.id} className="flex items-center gap-4 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                  <div className="w-24">
+                    <p className="text-sm font-black text-slate-700">{w.name}</p>
+                    <p className="text-[10px] text-[#3483FA] font-bold">Início: {w.startTime}</p>
+                  </div>
+                  <input type="number" value={w.duration / 60} onChange={(e) => handleUpdateDuration(i, parseFloat(e.target.value))} className="flex-1 p-2 rounded border border-slate-300 text-center font-black text-lg focus:border-[#3483FA] outline-none" />
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-4 md:p-12 max-w-5xl mx-auto" onClick={() => speak('')} style={{ backgroundColor: '#EBEBEB', minHeight: '100vh' }}>
+      {/* Cabeçalho Mercado Livre */}
+      <header className="flex justify-between items-center mb-8 bg-[#FFE600] p-5 rounded-xl shadow-sm border-b-2 border-yellow-400">
+        <div className="flex items-center gap-4 text-slate-900">
+          <div className="bg-white p-2 rounded-xl shadow-sm"><Package size={28} /></div>
+          <div>
+            <h1 className="text-2xl font-black tracking-tighter uppercase leading-none">Waves SSC7</h1>
+            <p className="text-slate-800 text-[10px] font-black uppercase tracking-widest mt-1">Lages, SC • Sincronização em Tempo Real</p>
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <div className="hidden md:flex items-center gap-2 bg-white/40 px-3 py-1 rounded-full text-[10px] font-black text-slate-900 uppercase">
+            <RefreshCw size={12} className={syncData.isRunning ? 'animate-spin' : ''} /> Cloud Ativa
+          </div>
+          <button onClick={() => setView('setup')} className="p-3 bg-white/30 rounded-lg hover:bg-white/50 text-slate-900 transition-all"><Settings size={22} /></button>
+          <button onClick={() => setIsMuted(!isMuted)} className={`p-3 rounded-lg shadow-sm transition-all ${isMuted ? 'bg-red-500 text-white border-red-600' : 'bg-white text-slate-900 border-slate-200'}`}>{isMuted ? <VolumeX size={22} /> : <Volume2 size={22} />}</button>
+        </div>
+      </header>
+
+      {/* Card Principal do Temporizador */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-10 md:p-16 text-center relative shadow-sm overflow-hidden mb-8">
+        <div className="relative z-10">
+          <div className="flex justify-center items-center gap-3 mb-8">
+            <span className={`px-6 py-2 rounded-full font-black uppercase tracking-widest text-xs border-2 ${timeLeft <= syncData.alarmTriggerMinutes * 60 ? 'bg-red-500 text-white border-red-400 animate-pulse' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>
+              {currentWave.name}
+            </span>
+            {syncData.isAutoStartEnabled && syncData.activeWaveIndex === 0 && !syncData.isRunning && (
+              <span className="bg-[#3483FA]/10 text-[#3483FA] px-4 py-2 rounded-full font-black uppercase text-[10px] border border-[#3483FA]/20 flex items-center gap-2">
+                <Clock size={12} /> Auto-Início: {syncData.scheduledStartTime}
+              </span>
+            )}
+          </div>
+          <div className={`text-[10rem] md:text-[14rem] font-black my-4 font-mono tracking-tighter leading-none transition-all duration-500 ${timeLeft <= syncData.alarmTriggerMinutes * 60 ? 'text-red-500 scale-105' : 'text-slate-900'}`}>
+            {formatTime(timeLeft)}
+          </div>
+          <div className="max-w-lg mx-auto mb-14">
+            <div className="w-full bg-slate-100 h-7 rounded-full overflow-hidden border-2 border-slate-200 p-1">
+              <div 
+                className={`h-full rounded-full transition-all duration-1000 ${timeLeft <= syncData.alarmTriggerMinutes * 60 ? 'bg-red-500' : 'bg-[#FFE600]'}`} 
+                style={{ width: `${progress}%` }} 
+              />
+            </div>
+          </div>
+          <div className="flex flex-wrap justify-center gap-5">
+            <button onClick={handleReset} className="bg-slate-100 text-slate-700 px-8 py-5 rounded-2xl hover:bg-slate-200 transition-all font-black uppercase text-sm border-2 border-slate-200 flex items-center gap-3"><RotateCcw size={20} /> Reset Geral</button>
+            <button onClick={handleToggleTimer} className={`px-16 py-6 rounded-2xl font-black uppercase text-lg flex items-center gap-3 shadow-xl transition-all transform active:scale-95 ${syncData.isRunning ? 'bg-[#3483FA] text-white' : 'bg-[#FFE600] text-slate-950 hover:brightness-105'}`}>
+              {syncData.isRunning ? <><Pause size={28} /> Pausar Tudo</> : <><Play size={28} strokeWidth={3} /> Iniciar Todas</>}
+            </button>
+            {timeLeft === 0 && syncData.activeWaveIndex < syncData.waves.length - 1 && (
+              <button onClick={handleNextWave} className="bg-[#3483FA] px-10 py-6 rounded-2xl font-black text-white shadow-xl animate-bounce uppercase border-b-4 border-blue-700">Próxima Onda</button>
+            )}
+          </div>
+        </div>
+        <div className="absolute -bottom-20 -right-20 opacity-[0.05] rotate-12 pointer-events-none text-slate-900">
+          <Package size={550} />
+        </div>
+      </div>
+
+      {/* Grelha de Ondas */}
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4">
+        {syncData.waves.map((w, i) => (
+          <div key={w.id} className={`p-6 rounded-2xl border-2 transition-all ${i === syncData.activeWaveIndex ? 'border-[#FFE600] bg-white shadow-md scale-105' : i < syncData.activeWaveIndex ? 'border-transparent bg-slate-200/50 opacity-40 grayscale' : 'border-white bg-white opacity-80'}`}>
+            <div className="text-[10px] font-black text-slate-400 uppercase mb-2 tracking-widest">{i < syncData.activeWaveIndex ? 'Concluída' : i === syncData.activeWaveIndex ? 'Em curso' : 'Fila'}</div>
+            <div className="text-sm font-black text-slate-800">{w.name}</div>
+            <div className="text-xl font-mono font-black text-[#3483FA]/70 leading-none mt-1">{w.startTime}</div>
+          </div>
+        ))}
+      </div>
+
+      <footer className="mt-12 flex flex-wrap justify-center gap-4">
+        <div className="bg-white border border-slate-200 px-6 py-2 rounded-xl text-[10px] font-black text-slate-500 uppercase tracking-widest shadow-sm flex items-center gap-2">
+          <Clock size={14} /> Hora Sistema: {systemTime}
+        </div>
+        <div className="bg-white border border-slate-200 px-6 py-2 rounded-xl text-[10px] font-black text-red-500 uppercase tracking-widest shadow-sm flex items-center gap-2">
+          <Bell size={14} /> Alerta: {syncData.alarmTriggerMinutes}min
+        </div>
+      </footer>
+    </div>
+  );
+};
+
+export default App;
